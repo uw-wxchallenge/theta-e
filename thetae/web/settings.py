@@ -44,6 +44,15 @@ def main(config, stid, forecast_date):
     params['models'] = str(list(config['Models'].keys()))
     params['default_model'] = config['Models'].keys()[0]
     params['bufr_models'] = str([m for m in config['Models'].keys() if 'bufr_name' in config['Models'][m].keys()])
+    # Models on the time-height page: sounding models, time-height-only models ([Plot][[TimeHeight]], e.g. RAP)
+    # and Open-Meteo models (profiles from pressure-level forecasts)
+    try:
+        timeheight_only = list(config['Plot']['TimeHeight'].sections)
+    except KeyError:
+        timeheight_only = []
+    params['timeheight_models'] = str([m for m in config['Models'].keys() if 'bufr_name' in config['Models'][m].keys()
+                                       or config['Models'][m].get('driver') == 'thetae.data_parsers.openmeteo']
+                                      + timeheight_only)
     params['colors'] = str([config['Models'][m]['color'] for m in config['Models'].keys()])
 
     # Replace the template with parameters

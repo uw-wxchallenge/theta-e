@@ -11,6 +11,7 @@ $$plotROOT = '$plot_directory';
 $$models = $models;
 $$defaultModel = '$default_model';
 $$bufrModels = $bufr_models;
+$$timeHeightModels = $timeheight_models;
 
 $$stid = '$stid';
 $$timezone = '$timezone';

@@ -97,9 +97,13 @@ def get_obs(config, stid, start, end):
 
     # Reformat data into hourly obs
     # Find mode of minute data: where the hourly metars are. Sometimes there are additional obs at odd times that would
-    # mess with rain totals.
+    # mess with rain totals. Since 2026 MesoWest also returns 5-minute ASOS data (whole-degree C temperatures, :00 to
+    # :55) that tie with the METAR minute, so only rows with measured sea-level pressure (METARs only) are counted.
+    metar_rows = obspd[obspd['sea_level_pressure'].notnull()]
+    if len(metar_rows) == 0:
+        metar_rows = obspd
     minutes = []
-    for row in obspd.iterrows():
+    for row in metar_rows.iterrows():
         date = row[1][datename]
         minutes.append(pd.to_datetime(date).minute)  # convert pd str to dt
     minute_count = np.bincount(np.array(minutes))

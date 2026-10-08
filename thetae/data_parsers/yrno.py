@@ -9,7 +9,7 @@ Retrieve forecast data from yr.no.
 """
 
 from thetae import Forecast
-from thetae.util import to_float, c_to_f, ms_to_kt, mm_to_in
+from thetae.util import to_float, c_to_f, ms_to_kt, mm_to_in, wind_day_window
 from datetime import timedelta
 from dateutil.parser import parse as parse_iso
 import requests
@@ -20,7 +20,7 @@ from .nws import etree_to_dict
 default_model_name = 'YRNO'
 
 
-def get_yrno_forecast(stid, state, city, forecast_date):
+def get_yrno_forecast(stid, state, city, forecast_date, wind_window):
     """
     Retrieve yr.no forecast for a city, state
 
@@ -66,7 +66,8 @@ def get_yrno_forecast(stid, state, city, forecast_date):
     forecast_end = forecast_start + timedelta(days=1)
     hourly_high = hourly.loc[forecast_start:forecast_end, 'temperature'].max()
     hourly_low = hourly.loc[forecast_start:forecast_end, 'temperature'].min()
-    hourly_wind = hourly.loc[forecast_start:forecast_end, 'windSpeed'].max()
+    # Max wind is over the local midnight-to-midnight day (as in the NWS climate report), not 06Z-06Z
+    hourly_wind = hourly.loc[wind_window[0]:wind_window[1] - timedelta(seconds=1), 'windSpeed'].max()
     hourly_rain = hourly.loc[forecast_start:forecast_end - timedelta(hours=1), 'rain'].sum()
 
     # Create the Forecast object
@@ -99,6 +100,6 @@ def main(config, model, stid, forecast_date):
     state = '_'.join([s.lower().capitalize() for s in state.split()])
 
     # Get forecast
-    forecast = get_yrno_forecast(stid, state, city, forecast_date)
+    forecast = get_yrno_forecast(stid, state, city, forecast_date, wind_day_window(config, stid, forecast_date))
 
     return forecast

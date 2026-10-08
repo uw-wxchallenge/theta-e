@@ -9,6 +9,7 @@ Retrieve GFS or NAM MOS data.
 """
 
 from thetae import Forecast
+from thetae.util import wind_day_window
 from datetime import datetime, timedelta
 import pandas as pd
 import numpy as np
@@ -41,7 +42,7 @@ def qpf_interpreter(qpf):
     return new_p
 
 
-def get_mos_forecast(stid, mos_model, init_date, forecast_date):
+def get_mos_forecast(stid, mos_model, init_date, forecast_date, wind_window):
     """
     Retrieve MOS data. No unit conversions, yay!
 
@@ -54,17 +55,20 @@ def get_mos_forecast(stid, mos_model, init_date, forecast_date):
     # Create forecast object
     forecast = Forecast(stid, default_model_name, forecast_date)
 
-    # For NBS, model run time is 1 hour later
-    if mos_model.upper() == 'NBS':
-        init_date = init_date + timedelta(hours=1)
-
-    # Retrieve the model data
+    # Retrieve the model data. IEM has labeled NBS runs both at the synoptic hour and 1 hour later (e.g. 12Z vs 13Z), so
+    # for NBS try the synoptic hour first and fall back to 1 hour later.
     base_url = 'http://mesonet.agron.iastate.edu/mos/csv.php?station=%s&runtime=%s&model=%s'
-    formatted_date = init_date.strftime('%Y-%m-%d%%20%H:00')
-    url = base_url % (stid, formatted_date, mos_model)
-    response = requests.get(url, stream=True)
-    # Create pandas DataFrame
-    df = pd.read_csv(response.raw, index_col=False)
+    init_dates = [init_date]
+    if mos_model.upper() == 'NBS':
+        init_dates.append(init_date + timedelta(hours=1))
+    for init in init_dates:
+        formatted_date = init.strftime('%Y-%m-%d%%20%H:00')
+        url = base_url % (stid, formatted_date, mos_model)
+        response = requests.get(url, stream=True)
+        # Create pandas DataFrame
+        df = pd.read_csv(response.raw, index_col=False)
+        if len(df.index) > 0:
+            break
     # Raise exception if DataFrame is empty
     if len(df.index) == 0:
         raise ValueError('mos: error: empty DataFrame; data missing.')
@@ -116,9 +120,11 @@ def get_mos_forecast(stid, mos_model, init_date, forecast_date):
     raw_low = df.iloc[iloc_start_include:iloc_end]['tmp'].min()
     nx_high = df.iloc[iloc_start_exclude:iloc_end]['n_x'].max()
     nx_low = df.iloc[iloc_start_exclude:iloc_end]['n_x'].min()
+    # Max wind is over the local midnight-to-midnight day (as in the NWS climate report), not 06Z-06Z
+    wind = df.loc[wind_window[0]:wind_window[1] - timedelta(seconds=1), 'wsp'].max()
     # Set the daily
     forecast.daily.set_values(np.nanmax([raw_high, nx_high]), np.nanmin([raw_low, nx_low]),
-                             df.iloc[iloc_start_include:iloc_end]['wsp'].max(),
+                             wind,
                              df.iloc[iloc_start_exclude:iloc_end]['q06'].sum())
 
     return forecast
@@ -144,7 +150,8 @@ def main(config, model, stid, forecast_date):
         init_date = forecast_date - timedelta(hours=24)
 
     # Get forecast
-    forecast = get_mos_forecast(stid, mos_model, init_date, forecast_date)
+    forecast = get_mos_forecast(stid, mos_model, init_date, forecast_date,
+                                wind_day_window(config, stid, forecast_date))
 
     return forecast
 
@@ -164,7 +171,8 @@ def historical(config, model, stid, forecast_dates):
     for forecast_date in forecast_dates:
         init_date = forecast_date - timedelta(hours=12)
         try:
-            forecast = get_mos_forecast(stid, mos_model, init_date, forecast_date)
+            forecast = get_mos_forecast(stid, mos_model, init_date, forecast_date,
+                                        wind_day_window(config, stid, forecast_date))
             forecasts.append(forecast)
         except BaseException as e:
             if int(config['debug']) > 9:

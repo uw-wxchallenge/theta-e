@@ -9,7 +9,7 @@ Retrieve forecasts from the new weather.com API.
 """
 
 from thetae import Forecast
-from thetae.util import epoch_time_to_datetime, mph_to_kt, dewpoint_from_t_rh
+from thetae.util import epoch_time_to_datetime, mph_to_kt, dewpoint_from_t_rh, wind_day_window
 from datetime import datetime, timedelta
 import requests
 import pandas as pd
@@ -26,7 +26,7 @@ def dn_to_timedelta(s):
         return s
 
 
-def get_twc_forecast(stid, api_key, forecast_date):
+def get_twc_forecast(stid, api_key, forecast_date, wind_window):
 
     # retrieve api json data
     api_url = 'https://api.weather.com/v3/wx/forecast/daily/5day'
@@ -77,7 +77,8 @@ def get_twc_forecast(stid, api_key, forecast_date):
     forecast_end = forecast_start + timedelta(days=1)
     daily_high = twc_hourly.loc[forecast_start:forecast_end, 'temperature'].max()
     daily_low = twc_hourly.loc[forecast_start:forecast_end, 'temperature'].min()
-    daily_wind = twc_hourly.loc[forecast_start:forecast_end, 'windSpeed'].max()
+    # Max wind is over the local midnight-to-midnight day (as in the NWS climate report), not 06Z-06Z
+    daily_wind = twc_hourly.loc[wind_window[0]:wind_window[1] - timedelta(seconds=1), 'windSpeed'].max()
     daily_rain = twc_hourly.loc[forecast_start:forecast_end - timedelta(hours=1), 'rain'].sum()
 
     # create Forecast object
@@ -99,6 +100,6 @@ def main(config, model, stid, forecast_date):
         raise KeyError('wunderground.py: no api_key parameter defined for model %s in config!' % model)
 
     # Get forecast
-    forecast = get_twc_forecast(stid, api_key, forecast_date)
+    forecast = get_twc_forecast(stid, api_key, forecast_date, wind_day_window(config, stid, forecast_date))
 
     return forecast

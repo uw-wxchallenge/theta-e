@@ -1,4 +1,21 @@
-./my.conf
-./.idea
-./site_data
-./archive
+# Local data (database, stats, CLI cache) -- never commit
+/archive/
+/site_data/
+
+# Live configs and backups hold API keys -- never commit
+/wx.conf
+/wx.conf.*
+/wx-*.conf
+/my.conf
+/mosx.conf
+
+# Editor / Python leftovers
+/.idea/
+*.swp
+*.pyc
+__pycache__/
+*.bak-*
+*.pre-*
+
+# Local AI-assistant notes
+/CLAUDE.md

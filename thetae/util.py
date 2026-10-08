@@ -430,6 +430,23 @@ def localized_date_to_utc(date):
     return date.astimezone(pytz.utc).replace(tzinfo=None)
 
 
+def wind_day_window(config, stid, forecast_date):
+    """
+    Return the timezone-unaware UTC (start, end) of the local midnight-to-midnight day for forecast_date. WxChallenge
+    verifies max wind from the NWS daily climate report, which covers local midnight to midnight rather than 06Z to
+    06Z, so daily wind values should be taken over [start, end). Falls back to 06Z-06Z if the station has no timezone.
+    """
+    day = datetime(forecast_date.year, forecast_date.month, forecast_date.day)
+    try:
+        tz = pytz.timezone(config['Stations'][stid]['timezone'])
+    except KeyError:
+        print('wind_day_window warning: no timezone in config for %s; using 06Z-06Z' % stid)
+        return day + timedelta(hours=6), day + timedelta(hours=30)
+    start = localized_date_to_utc(tz.localize(day))
+    end = localized_date_to_utc(tz.localize(day + timedelta(days=1)))
+    return start, end
+
+
 def epoch_time_to_datetime(timestamp, timezone=None):
     """
     Return a timezone-unaware datetime from an epoch time representation. If timezone string is provided, then

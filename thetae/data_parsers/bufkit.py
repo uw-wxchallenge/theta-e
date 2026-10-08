@@ -13,7 +13,7 @@ from datetime import timedelta, datetime
 import re
 import numpy as np
 import pandas as pd
-from thetae.util import c_to_f, ms_to_kt, wind_uv_to_speed_dir, mm_to_in
+from thetae.util import c_to_f, ms_to_kt, wind_uv_to_speed_dir, mm_to_in, wind_day_window
 from thetae import Forecast
 from io import open
 
@@ -59,9 +59,13 @@ def get_bufkit_forecast(config, bufr, bufkit_dir, model, bufr_name, cycle, stid,
         if 'wrf' not in bufr_name:
             # Call bufrgruven, save files in specified bufr directory
             command = ('%s --dset %s --cycle %s --stations %s --noascii --nozipit --metdat %s --date %s '
-                       '--noverbose >& /dev/null' %
+                       '--noverbose >/dev/null 2>&1' %
                        (bufr, bufr_search_model, model_cycle, stid.lower(), bufkit_dir, model_time[:-2]))
-            os.system(command)
+            print('Running BUFKIT command:')
+            print(command)
+
+            status = os.system(command)
+            print('BUFKIT command exit status:', status)
         else:
             # wget WRF bufkit files from University of Washington, save files in specified bufr directory
             domain = bufr_name[-2:]
@@ -165,7 +169,9 @@ def bufr_surface_parser(config, model, stid, forecast_date, bufr_file_name):
 
         # Append values at this time step
         dateTime.append(validtime)
-        pressure.append(vals[varlist.index('PMSL')])
+        # RRFS BUFR has no PMSL (all -9999); store missing rather than -9999
+        pmsl = vals[varlist.index('PMSL')]
+        pressure.append(np.nan if float(pmsl) == -9999. else pmsl)
         temperature.append(c_to_f(vals[varlist.index('T2MS')]))
         dewpoint.append(c_to_f(vals[varlist.index('TD2M')]))
         uwind = ms_to_kt(vals[varlist.index('UWND')])
@@ -198,6 +204,9 @@ def bufr_surface_parser(config, model, stid, forecast_date, bufr_file_name):
     # Convert to forecast object
     forecast_start = forecast_date.replace(hour=6)
     forecast_end = forecast_start + timedelta(days=1)
+    # Max wind is over the local midnight-to-midnight day (as in the NWS climate report), not 06Z-06Z
+    wind_start, wind_end = wind_day_window(config, stid, forecast_date)
+    wind_end -= timedelta(seconds=1)
 
     # Find forecast start location in timeseries
     try:
@@ -212,11 +221,11 @@ def bufr_surface_parser(config, model, stid, forecast_date, bufr_file_name):
     forecast.timeseries.data = df
 
     # Find forecast end location in time series and save daily values if it exists
-    if df.index[-1] >= forecast_end:
+    if df.index[-1] >= max(forecast_end, wind_end - timedelta(hours=1)):
         iloc_end = df.index.get_loc(forecast_end)
         high = int(np.round(df.iloc[iloc_start_include:iloc_end]['temperature'].max()))
         low = int(np.round(df.iloc[iloc_start_include:iloc_end]['temperature'].min()))
-        max_wind = int(np.round(df.iloc[iloc_start_include:iloc_end]['windSpeed'].max()))
+        max_wind = int(np.round(df.loc[wind_start:wind_end, 'windSpeed'].max()))
         total_rain = np.sum(df.iloc[iloc_start_include + 1:iloc_end]['rain'])
         forecast.daily.set_values(high, low, max_wind, total_rain)
     else:

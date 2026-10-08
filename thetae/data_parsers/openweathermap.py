@@ -9,7 +9,7 @@ Retrieve OpenWeatherMap forecast data.
 """
 
 from thetae import Forecast
-from thetae.util import date_to_datetime, mm_to_in, mph_to_kt, dewpoint_from_t_rh
+from thetae.util import date_to_datetime, mm_to_in, mph_to_kt, dewpoint_from_t_rh, wind_day_window
 from datetime import datetime, timedelta
 import requests
 import pandas as pd
@@ -37,7 +37,7 @@ def get_parameter(value, param, is_list=False):
     return new_value
 
 
-def get_owm_forecast(stid, lat, lon, api_key, forecast_date):
+def get_owm_forecast(stid, lat, lon, api_key, forecast_date, wind_window):
 
     # Retrieve data
     api_url = 'http://api.openweathermap.org/data/2.5/forecast'
@@ -99,7 +99,8 @@ def get_owm_forecast(stid, lat, lon, api_key, forecast_date):
         daily_low = owm_df.loc[forecast_start:forecast_end, 'temp_min'].min()
     except KeyError:
         daily_low = owm_df.loc[forecast_start:forecast_end, 'temperature'].min()
-    daily_wind = owm_df.loc[forecast_start:forecast_end, 'windSpeed'].max()
+    # Max wind is over the local midnight-to-midnight day (as in the NWS climate report), not 06Z-06Z
+    daily_wind = owm_df.loc[wind_window[0]:wind_window[1] - timedelta(seconds=1), 'windSpeed'].max()
     daily_rain = np.nanmax([owm_df.loc[forecast_start + timedelta(hours=3):forecast_end, 'rain'].sum(), 0.0])
 
     # Create Forecast object
@@ -128,6 +129,7 @@ def main(config, model, stid, forecast_date):
         raise KeyError('openweathermap: no api_key parameter defined for model %s in config!' % model)
 
     # Get forecast
-    forecast = get_owm_forecast(stid, lat, lon, api_key, forecast_date)
+    forecast = get_owm_forecast(stid, lat, lon, api_key, forecast_date,
+                                wind_day_window(config, stid, forecast_date))
 
     return forecast

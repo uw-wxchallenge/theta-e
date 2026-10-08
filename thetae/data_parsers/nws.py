@@ -9,7 +9,7 @@ Retrieve NWS forecast data.
 """
 
 from thetae import Forecast
-from thetae.util import to_float, localized_date_to_utc, mph_to_kt
+from thetae.util import to_float, localized_date_to_utc, mph_to_kt, wind_day_window
 from datetime import datetime, timedelta
 from dateutil.parser import parse as parse_iso
 import requests
@@ -162,7 +162,9 @@ def get_nws_forecast(config, stid, lat, lon, forecast_date):
     forecast_end = forecast_start + timedelta(days=1)
     hourly_high = hourly.loc[forecast_start:forecast_end, 'temperature'].max()
     hourly_low = hourly.loc[forecast_start:forecast_end, 'temperature'].min()
-    hourly_wind = hourly.loc[forecast_start:forecast_end, 'windSpeed'].max()
+    # Max wind is over the local midnight-to-midnight day (as in the NWS climate report), not 06Z-06Z
+    wind_start, wind_end = wind_day_window(config, stid, forecast_date)
+    hourly_wind = hourly.loc[wind_start:wind_end - timedelta(seconds=1), 'windSpeed'].max()
     hourly_rain = hourly.loc[forecast_start:forecast_end - timedelta(hours=1), 'rain'].sum()
 
     # Create the Forecast object
@@ -201,7 +203,9 @@ def get_nws_forecast(config, stid, lat, lon, forecast_date):
         daily_low = daily.loc[forecast_date - timedelta(hours=6), 'temperature']
     except KeyError:
         daily_low = np.nan
-    daily_wind = mph_to_kt(np.max(daily.loc[forecast_start:forecast_end]['windSpeed']))
+    # The periods' startTime is local time, so take the Today and Tonight periods of the local forecast date
+    local_day = datetime(forecast_date.year, forecast_date.month, forecast_date.day)
+    daily_wind = mph_to_kt(np.max(daily.loc[local_day:local_day + timedelta(hours=23, minutes=59)]['windSpeed']))
 
     # Update the Forecast object
     forecast.daily.set_values(np.nanmax([hourly_high, daily_high]), np.nanmin([hourly_low, daily_low]),

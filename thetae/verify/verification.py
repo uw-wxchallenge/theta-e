@@ -303,17 +303,28 @@ def get_verification(config, stid, start_dt, end_dt, use_climo=False, use_cf6=Tr
     obs_daily.rename(columns={'precip_accum_six_hour': 'rain'}, inplace=True)
 
     # For hourly data, retrieve the data from the database. Only if the database returns an error do we retrieve data
-    # from MesoWest.
+    # from MesoWest. Start 6 hours early so the first local midnight-to-midnight day is complete for wind.
     try:
-        obs_hour = readTimeSeries(config, stid, 'forecast', 'OBS', start_date=start_dt, end_date=end_dt).data
+        obs_hour = readTimeSeries(config, stid, 'forecast', 'OBS', start_date=start_dt - timedelta(hours=6),
+                                  end_date=end_dt).data
     except MissingDataError:
         if config['debug'] > 9:
             print('verification: missing data in db for hourly obs; retrieving from MesoWest')
-        obs_hour = get_obs(config, stid, start, end).data
+        obs_hour = get_obs(config, stid, *meso_api_dates(start_dt - timedelta(hours=6), end_dt)).data
 
-    # Set DateTime column and round precipitation to avoid trace accumulations
-    dateobj = pd.Index(pd.to_datetime(obs_hour[datename])).tz_localize(None) - timedelta(hours=6)
-    obs_hour[datename] = dateobj
+    # Hourly max wind per local midnight-to-midnight day. Per WxChallenge rules, an hourly wind may only override the
+    # climate report wind if it is within the report's local day, not anywhere in 06Z-06Z.
+    utc_times = pd.Index(pd.to_datetime(obs_hour[datename])).tz_localize(None)
+    try:
+        local_days = utc_times.tz_localize('UTC').tz_convert(config['Stations'][stid]['timezone']).tz_localize(None)
+    except KeyError:
+        print('verification warning: no timezone in config for %s; using 06Z-06Z days for wind' % stid)
+        local_days = utc_times - timedelta(hours=6)
+    hour_wind_local_day = obs_hour['WINDSPEED'].groupby(local_days.normalize()).max()
+
+    # Set DateTime column and round precipitation to avoid trace accumulations. Drop the extra early hours.
+    obs_hour[datename] = utc_times - timedelta(hours=6)
+    obs_hour = obs_hour[utc_times >= start_dt].copy()
     obs_hour['RAINHOUR'] = obs_hour['RAINHOUR'].round(2)
 
     aggregate = {datename: day}
@@ -325,7 +336,7 @@ def get_verification(config, stid, start_dt, end_dt, use_climo=False, use_cf6=Tr
     obs_hour_day = pd.DataFrame(columns = ['high','low','wind','rain'])
     obs_hour_day['high'] = obs_hour['TEMPERATURE'].resample('1D').max()
     obs_hour_day['low'] = obs_hour['TEMPERATURE'].resample('1D').min()
-    obs_hour_day['wind'] = obs_hour['WINDSPEED'].resample('1D').max()
+    obs_hour_day['wind'] = hour_wind_local_day
     obs_hour_day['rain'] = obs_hour['RAINHOUR'].resample('1D').sum()
 
     obs_daily.index = obs_daily['DATETIME']

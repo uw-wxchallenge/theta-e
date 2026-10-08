@@ -14,16 +14,18 @@ import re
 import numpy as np
 from scipy import interpolate
 import pandas as pd
-from math import ceil
+from math import ceil, floor
 from datetime import datetime, timedelta
 from io import open
+import requests
 import matplotlib
 
 matplotlib.use('agg')
 import matplotlib.pyplot as plt
 
 
-def plot_timeheight(config, stid, model, forecast_date, variable, df, plot_dir, img_type):
+def plot_timeheight(config, stid, model, forecast_date, variable, df, plot_dir, img_type, run_time=None,
+                    fallback=False, vrange_fixed=None):
     """
     Timeseries plotting function
 
@@ -51,7 +53,7 @@ def plot_timeheight(config, stid, model, forecast_date, variable, df, plot_dir, 
         ytop = 200
         extend = 'max'
         plot_variable = np.ma.masked_array(dewpoint_dep.astype('float'))
-    elif variable == 'cloud' and model[0:3] != 'GFS' and model[0:4] != 'HRRR':
+    elif variable == 'cloud' and model[0:3] != 'GFS' and model[0:4] not in ['HRRR', 'RRFS']:
         cloud_fr = df.loc[idx[:, 'CFRL'], :]
         cmap = 'Blues_r'
         vrange = [0, 100]
@@ -102,6 +104,11 @@ def plot_timeheight(config, stid, model, forecast_date, variable, df, plot_dir, 
     if config['debug'] > 50:
         print('%s Bufkit time-height data processed--VARIABLE: %s for MODEL = %s' % (stid, variable, model))
 
+    # Shared color scale across models (see common_vranges)
+    if vrange_fixed is not None:
+        vrange = vrange_fixed
+        extend = 'neither'
+
     # model times (x-values)
     times = pd.to_datetime(df.loc[idx[:, 'TMPC'], :].columns)
 
@@ -147,14 +154,20 @@ def plot_timeheight(config, stid, model, forecast_date, variable, df, plot_dir, 
 
     # Plot configurations and saving
     ax.grid()
-    ax.set_title('{} forecast {} time-height at {}'.format(model, variable.upper(), stid))
+    title = '{} forecast {} time-height at {}'.format(model, variable.upper(), stid)
+    if run_time is not None:
+        title += '\nrun {:%Y-%m-%d %HZ}'.format(run_time)
+        if fallback:
+            title += ' (latest run not yet available)'
+    ax.set_title(title)
     ax.set_xlabel('Valid time')
     ax.set_ylabel('Pressure (hPa)')
 
     # axis range and label formatting
     from matplotlib import dates
     from mpl_toolkits.axes_grid1 import make_axes_locatable
-    ax.set_xlim(times[0], forecast_date + timedelta(hours=42))
+    # An older (fallback) run starts a day earlier; keep the same window as a current run
+    ax.set_xlim(max(times[0], forecast_date - timedelta(hours=12)), forecast_date + timedelta(hours=42))
     ax.set_ylim(ylims)
     ax.xaxis.set_major_locator(dates.HourLocator(byhour=list(range(0, 25, 3))))
     ax.xaxis.set_major_formatter(dates.DateFormatter('%HZ'))
@@ -173,7 +186,138 @@ def plot_timeheight(config, stid, model, forecast_date, variable, df, plot_dir, 
     return
 
 
-def bufr_timeheight_parser(config, model, stid, forecast_date):
+def timeheight_only_models(config):
+    """
+    Sounding models listed under [Plot][[TimeHeight]] (e.g. RAP, for its cloud fraction). They are plotted here
+    only; they are not in [Models], so they never reach the forecast database, stats or other pages.
+    """
+    try:
+        section = config['Plot']['TimeHeight']
+    except KeyError:
+        return OrderedDict()
+    return OrderedDict((m, section[m]) for m in section.sections)
+
+
+def sounding_model_config(config, model):
+    if model in config['Models']:
+        return config['Models'][model]
+    return timeheight_only_models(config)[model]
+
+
+def get_timeheight_only_bufkit(config, model, stid, forecast_date):
+    """
+    Download a time-height-only model's bufkit file through BUFRgruven, as bufkit.py does for [Models] entries.
+    """
+    from thetae.data_parsers.bufkit import get_bufkit_forecast
+    model_config = timeheight_only_models(config)[model]
+    bufkit_dir = config['BUFKIT']['BUFKIT_directory']
+    file_name = '%s/bufkit/%s%s.%s_%s.buf' % (bufkit_dir, (forecast_date - timedelta(days=1)).strftime('%Y%m%d'),
+                                              model_config['run_time'].replace('Z', ''), model_config['bufr_name'],
+                                              stid.lower())
+    if os.path.isfile(file_name):
+        return
+    try:
+        get_bufkit_forecast(config, config['BUFKIT']['BUFR'], bufkit_dir, model, model_config['bufr_name'],
+                            model_config['run_time'], stid, forecast_date)
+    except BaseException as e:
+        # Not posted yet; the plot falls back to the previous run
+        if config['debug'] > 9:
+            print('plot.timeheight: could not get bufkit file for %s: %s' % (model, e))
+
+
+# Open-Meteo pressure levels used for time-height profiles (not every model has all of them)
+openmeteo_levels = [1000, 975, 950, 925, 900, 850, 800, 700, 600, 500, 400, 300, 250, 200]
+openmeteo_profile_vars = ['temperature', 'dew_point', 'cloud_cover', 'wind_speed', 'wind_direction',
+                          'geopotential_height', 'vertical_velocity']
+
+
+def openmeteo_timeheight_profile(config, model, stid, forecast_date):
+    """
+    Build a time-height DataFrame, in the same layout as bufr_timeheight_parser, from Open-Meteo pressure-level
+    forecasts. Uses the model's 'profile_om_model' if set (ECMWF IFS 9 km has no pressure levels on Open-Meteo,
+    so ECMWF uses the 0.25 degree IFS), else its 'om_model'. Values are interpolated in pressure to the same
+    5 hPa levels as the soundings; levels below ground are dropped. Fields a model doesn't provide (e.g.
+    vertical velocity for ICON and GEM) come back all-missing and are not plotted.
+    """
+    model_config = config['Models'][model]
+    om_model = model_config.get('profile_om_model', model_config['om_model'])
+    params = {
+        'latitude': float(config['Stations'][stid]['latitude']),
+        'longitude': float(config['Stations'][stid]['longitude']),
+        'hourly': ','.join('%s_%dhPa' % (v, l) for v in openmeteo_profile_vars for l in openmeteo_levels),
+        'models': om_model,
+        'wind_speed_unit': 'kn',
+        'timezone': 'GMT',
+        'temporal_resolution': 'native',
+        'start_date': (forecast_date - timedelta(days=1)).strftime('%Y-%m-%d'),
+        'end_date': (forecast_date + timedelta(days=1)).strftime('%Y-%m-%d'),
+    }
+    response = requests.get('https://api.open-meteo.com/v1/forecast', params=params, timeout=120)
+    if response.status_code == 400:
+        raise IOError('plot.timeheight: Open-Meteo has no %s data for %s: %s' %
+                      (om_model, stid, response.json().get('reason', '')))
+    response.raise_for_status()
+    data = response.json()
+    hourly = data['hourly']
+    elevation = data.get('elevation', 0.)
+    times = pd.to_datetime(hourly['time'])
+    keep = (times >= forecast_date - timedelta(hours=12)) & (times <= forecast_date + timedelta(hours=42))
+
+    def level_array(var):
+        values = [hourly.get('%s_%dhPa' % (var, l), [None] * len(times)) for l in openmeteo_levels]
+        return np.array(values, dtype='float')[:, keep]  # (level, time)
+
+    temperature = level_array('temperature')
+    height = level_array('geopotential_height')
+    fields = {
+        'TMPC': temperature,
+        'DWPC': level_array('dew_point'),
+        'CFRL': level_array('cloud_cover'),
+        'HGHT': height,
+    }
+    speed = level_array('wind_speed')
+    direction = level_array('wind_direction')
+    # Same u/v convention as the bufkit parser (knots)
+    fields['UWND'] = speed * np.sin(direction * np.pi / 180. - np.pi)
+    fields['VWND'] = speed * np.cos(direction * np.pi / 180. - np.pi)
+    # Vertical velocity w (m/s) to omega in microbar/s, as in bufkit: omega = -rho g w, rho = p / (Rd T)
+    w = level_array('vertical_velocity')
+    pres_pa = np.array(openmeteo_levels, dtype='float')[:, None] * 100.
+    rho = pres_pa / (287.05 * (temperature + 273.15))
+    fields['OMEG'] = -rho * 9.81 * w * 10.
+
+    # Interpolate each time's profile in pressure to the bufkit levels (1045 to 200 hPa every 5 hPa)
+    plevs = list(range(200, 1050, 5))
+    plevs.reverse()
+    om_levels = np.array(openmeteo_levels, dtype='float')
+    profile = OrderedDict()
+    for t, valid_time in enumerate(times[keep]):
+        above_ground = np.isfinite(height[:, t]) & (height[:, t] >= elevation)
+        final_vars = OrderedDict()
+        for var, values in fields.items():
+            column = values[:, t]
+            ok = above_ground & np.isfinite(column)
+            if ok.sum() >= 2:
+                f = interpolate.interp1d(om_levels[ok], column[ok], bounds_error=False)
+                final_vars[var] = list(f(plevs))
+            else:
+                final_vars[var] = [np.nan] * len(plevs)
+        final_vars['PRES'] = plevs
+        profile[valid_time.to_pydatetime()] = final_vars
+    if not profile:
+        raise IOError('plot.timeheight: no Open-Meteo profile times for %s' % model)
+
+    variables = list(profile[list(profile.keys())[0]].keys())
+    index = pd.MultiIndex.from_tuples(list(zip(plevs * len(variables), np.repeat(variables, len(plevs)))),
+                                      names=['pressure', 'var'])
+    df = pd.DataFrame(index=index, columns=list(profile.keys()))
+    for var in variables:
+        for dt in profile.keys():
+            df[dt].loc[:, var] = np.array(profile[dt][var])
+    return df
+
+
+def bufr_timeheight_parser(config, model, stid, forecast_date, model_date=None):
     """
     Original code by Luke Madaus, modified by Joe Zagrodnik and Jonathan Weyn
 
@@ -182,9 +326,11 @@ def bufr_timeheight_parser(config, model, stid, forecast_date):
     """
     # Load bufkit file
     bufkit_dir = config['BUFKIT']['BUFKIT_directory']
-    model_run_hour = config['Models'][model]['run_time'].replace('Z', '')
-    bufr_name = config['Models'][model]['bufr_name']
-    model_date = (forecast_date - timedelta(days=1)).strftime('%Y%m%d')
+    model_run_hour = sounding_model_config(config, model)['run_time'].replace('Z', '')
+    bufr_name = sounding_model_config(config, model)['bufr_name']
+    if model_date is None:
+        model_date = forecast_date - timedelta(days=1)
+    model_date = model_date.strftime('%Y%m%d')
     file_name = '%s/bufkit/%s%s.%s_%s.buf' % (bufkit_dir, model_date, model_run_hour, bufr_name, stid.lower())
     try:
         infile = open(file_name, 'r')
@@ -351,6 +497,61 @@ def compute_bl_winds(bufkit_df):
     return bl_df
 
 
+# Top of the plotted pressure range for each variable (matches plot_timeheight)
+plot_tops = {'temperature': 650, 'dewPointDep': 200, 'windSpeed': 650, 'omega': 200}
+
+
+def plotted_values(df, variable, forecast_date):
+    """
+    Values of a time-height variable inside the plotted window (surface to the plot top, and the plotted times).
+    Returns None for variables without a shared scale.
+    """
+    idx = pd.IndexSlice
+    if variable not in plot_tops:
+        return None
+    tmpc = df.loc[idx[:, 'TMPC'], :]
+    if variable == 'temperature':
+        values = tmpc.values.astype('float')
+    elif variable == 'dewPointDep':
+        values = tmpc.values.astype('float') - df.loc[idx[:, 'DWPC'], :].values.astype('float')
+    elif variable == 'windSpeed':
+        uwnd = df.loc[idx[:, 'UWND'], :].values.astype('float')
+        vwnd = df.loc[idx[:, 'VWND'], :].values.astype('float')
+        values = np.sqrt(uwnd ** 2 + vwnd ** 2)
+    else:
+        values = df.loc[idx[:, 'OMEG'], :].values.astype('float')
+    pressure = tmpc.index.get_level_values('pressure').values.astype('float')
+    times = pd.to_datetime(tmpc.columns)
+    rows = pressure >= plot_tops[variable]
+    cols = (times >= max(times[0], forecast_date - timedelta(hours=12))) & \
+           (times <= forecast_date + timedelta(hours=42))
+    return values[np.ix_(rows, cols)]
+
+
+def common_vranges(model_data, forecast_date, variables):
+    """
+    Color-scale limits per variable that bound the lowest and highest plotted value across all models, so the
+    same color means the same value on every model's plot. Omega stays centered on zero.
+    """
+    vranges = {}
+    for variable in variables:
+        values = [plotted_values(d[0], variable, forecast_date) for d in model_data.values()]
+        values = [v[np.isfinite(v)] for v in values if v is not None]
+        values = [v for v in values if v.size > 0]
+        if not values:
+            continue
+        vmin = min(np.min(v) for v in values)
+        vmax = max(np.max(v) for v in values)
+        if variable == 'omega':
+            bound = ceil(max(abs(vmin), abs(vmax)) * 10) / 10.
+            vranges[variable] = [-bound, bound]
+        elif variable == 'windSpeed':
+            vranges[variable] = [floor(vmin / 5.) * 5, ceil(vmax / 5.) * 5]
+        else:
+            vranges[variable] = [floor(vmin), ceil(vmax)]
+    return vranges
+
+
 def delete_plots(stid, model, variables, plot_dir, img_type):
     for v in variables:
         plot_file = '{}/{}_timeheight_{}_{}.{}'.format(plot_dir, stid, v.upper(), model, img_type)
@@ -385,32 +586,83 @@ def main(config, stid, forecast_date):
         if config['debug'] > 50:
             print('plot.timeheight warning: using default image file format (svg)')
 
-    # Get list of models
-    models = list(config['Models'].keys())
+    # Sounding models: [Models] entries with a bufkit file, then time-height-only models such as RAP
+    sounding_models = [m for m in config['Models'].keys() if 'bufr_name' in config['Models'][m].keys()]
+    extra_models = list(timeheight_only_models(config).keys())
+    for model in extra_models:
+        get_timeheight_only_bufkit(config, model, stid, forecast_date)
+    # Open-Meteo models get profiles from Open-Meteo pressure-level forecasts
+    openmeteo_models = [m for m in config['Models'].keys()
+                        if config['Models'][m].get('driver') == 'thetae.data_parsers.openmeteo']
 
     # List of time-height variables
     variables = ['temperature', 'dewPointDep', 'cloud', 'windSpeed', 'omega']
 
-    # Make plots for models that have a bufkit file
-    for model in models:
-        if 'bufr_name' in config['Models'][model].keys():
+    # Read every model first, so all plots can share one color scale per variable
+    model_data = OrderedDict()
+    for model in sounding_models + extra_models:
+        # Use the current run (from the day before forecast_date). If it isn't posted yet (12Z runs
+        # arrive around 16Z, 18Z runs around 22Z), plot the previous day's run instead of leaving
+        # no plot. This relies on [BUFKIT] archive = True keeping older bufkit files.
+        run_hour = int(sounding_model_config(config, model)['run_time'].replace('Z', ''))
+        df = None
+        parse_error = False
+        for days_back, fallback in [(1, False), (2, True)]:
+            model_date = forecast_date - timedelta(days=days_back)
             try:
-                df = bufr_timeheight_parser(config, model, stid, forecast_date)
+                df = bufr_timeheight_parser(config, model, stid, forecast_date, model_date=model_date)
+                break
             except IOError:
-                if config['debug'] > 9:
-                    print('plot.timeheight: bufr file missing for %s; deleting old plots')
-                delete_plots(stid, model, variables, plot_directory, image_type)
                 continue
             except BaseException:
                 if config['traceback']:
                     raise
+                parse_error = True
+                break
+        if parse_error:
+            continue
+        if df is None:
+            if config['debug'] > 9:
+                print('plot.timeheight: bufr file missing for %s; deleting old plots' % model)
+            delete_plots(stid, model, variables, plot_directory, image_type)
+            continue
+        model_data[model] = (df, model_date.replace(hour=run_hour), fallback)
+
+    for model in openmeteo_models:
+        try:
+            df = openmeteo_timeheight_profile(config, model, stid, forecast_date)
+        except BaseException as e:
+            if config['debug'] > 9:
+                print('plot.timeheight: no Open-Meteo profile for %s (%s); deleting old plots' % (model, e))
+            delete_plots(stid, model, variables, plot_directory, image_type)
+            continue
+        model_data[model] = (df, None, False)
+
+    try:
+        vranges = common_vranges(model_data, forecast_date, variables)
+    except BaseException:
+        if config['traceback']:
+            raise
+        vranges = {}
+
+    for model, (df, run_time, fallback) in model_data.items():
+        for variable in variables:
+            # Skip fields this model doesn't provide (e.g. omega for ICON/GEM from Open-Meteo, cloud for
+            # GFS/HRRR/RRFS soundings) rather than writing an empty plot
+            try:
+                values = plotted_values(df, variable, forecast_date) if variable != 'cloud' else \
+                    df.loc[pd.IndexSlice[:, 'CFRL'], :].values.astype('float')
+            except KeyError:
+                values = np.array([np.nan])
+            if values is not None and not np.isfinite(values).any():
+                delete_plots(stid, model, [variable], plot_directory, image_type)
                 continue
-            for variable in variables:
-                if config['debug'] > 50:
-                    print('plot.timeheight: plotting %s for %s' % (variable, model))
-                try:
-                    plot_timeheight(config, stid, model, forecast_date, variable, df, plot_directory, image_type)
-                except BaseException:
-                    if config['traceback']:
-                        raise
+            if config['debug'] > 50:
+                print('plot.timeheight: plotting %s for %s' % (variable, model))
+            try:
+                plot_timeheight(config, stid, model, forecast_date, variable, df, plot_directory, image_type,
+                                run_time=run_time, fallback=fallback, vrange_fixed=vranges.get(variable))
+            except BaseException:
+                if config['traceback']:
+                    raise
     return

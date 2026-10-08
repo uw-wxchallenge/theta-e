@@ -9,7 +9,7 @@ Retrieve Aeris forecast data.
 """
 
 from thetae import Forecast
-from thetae.util import localized_date_to_utc
+from thetae.util import localized_date_to_utc, wind_day_window
 from datetime import datetime, timedelta
 from dateutil.parser import parse as parse_iso
 import requests
@@ -19,7 +19,7 @@ import numpy as np
 default_model_name = 'Aeris'
 
 
-def get_aeris_forecast(stid, lat, lon, api_id, api_secret, forecast_date):
+def get_aeris_forecast(stid, lat, lon, api_id, api_secret, forecast_date, wind_window):
 
     # Retrieve data
     api_url = 'https://api.aerisapi.com/forecasts/%s'
@@ -70,10 +70,12 @@ def get_aeris_forecast(stid, lat, lon, api_id, api_secret, forecast_date):
         daily_low = aeris_df.loc[forecast_start:forecast_end, 'minTempF'].min()
     except KeyError:
         daily_low = aeris_df.loc[forecast_start:forecast_end, 'temperature'].min()
+    # Max wind is over the local midnight-to-midnight day (as in the NWS climate report), not 06Z-06Z
+    wind_start, wind_end = wind_window[0], wind_window[1] - timedelta(seconds=1)
     try:
-        daily_wind = aeris_df.loc[forecast_start:forecast_end, 'windSpeedMaxKTS'].max()
+        daily_wind = aeris_df.loc[wind_start:wind_end, 'windSpeedMaxKTS'].max()
     except KeyError:
-        daily_wind = aeris_df.loc[forecast_start:forecast_end, 'windSpeed'].max()
+        daily_wind = aeris_df.loc[wind_start:wind_end, 'windSpeed'].max()
     daily_rain = aeris_df.loc[forecast_start:forecast_end - timedelta(hours=1), 'rain'].sum()
 
     # Create Forecast object
@@ -106,6 +108,7 @@ def main(config, model, stid, forecast_date):
         raise KeyError('aeris: no api_secret parameter defined for model %s in config!' % model)
 
     # Get forecast
-    forecast = get_aeris_forecast(stid, lat, lon, api_id, api_secret, forecast_date)
+    forecast = get_aeris_forecast(stid, lat, lon, api_id, api_secret, forecast_date,
+                                  wind_day_window(config, stid, forecast_date))
 
     return forecast

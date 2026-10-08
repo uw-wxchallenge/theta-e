@@ -14,6 +14,7 @@ from thetae import Forecast
 from thetae.util import wind_dir_to_deg
 from datetime import datetime, timedelta
 import re
+import time
 import pandas as pd
 import numpy as np
 try:
@@ -22,6 +23,23 @@ except ImportError:
     from urllib2 import urlopen, Request, HTTPError, URLError
 
 default_model_name = 'USL'
+
+
+def urlopen_retry(config, url, tries=4, wait=30):
+    """
+    urlopen, retrying on network errors such as intermittent DNS failures for microclimates.org. HTTP errors (e.g.
+    404) are raised immediately.
+    """
+    for attempt in range(1, tries + 1):
+        try:
+            return urlopen(url, timeout=60)
+        except HTTPError:
+            raise
+        except (URLError, OSError) as e:
+            if attempt == tries:
+                raise
+            print("usl: attempt %d of %d to open %s failed (%s); retrying in %d s" % (attempt, tries, url, e, wait))
+            time.sleep(wait)
 
 
 def remove_last_char(value):
@@ -45,7 +63,7 @@ def check_if_usl_forecast_exists(config, stid, run, forecast_date):
     api_url = 'http://www.microclimates.org/forecast/{}/'.format(stid)
     req = Request(api_url)
     try:
-        response = urlopen(req)
+        response = urlopen_retry(config, req)
     except HTTPError:
         if config['debug'] > 9:
             print("usl: forecast for %s at run time %s doesn't exist" % (stid, run_date))
@@ -66,7 +84,7 @@ def get_usl_forecast(config, stid, run, forecast_date):
     run_date = (forecast_date - timedelta(days=1)).replace(hour=int(run))
     get_url = api_url % (stid, datetime.strftime(run_date, '%Y%m%d_%H'))
     try:
-        response = urlopen(get_url)
+        response = urlopen_retry(config, get_url)
     except HTTPError:
         if config['debug'] > 9:
             print("usl: forecast for %s at run time %s doesn't exist" % (stid, run_date))
